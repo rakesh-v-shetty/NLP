@@ -4,225 +4,159 @@ import pickle
 import numpy as np
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-# Removed google.generativeai as we are no longer using the API
+import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
 import faiss
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline # Import transformers components
-import torch # For device management
+import torch
 
 app = Flask(__name__)
 CORS(app)
 
 # --- Configuration ---
-# No GEMINI_API_KEY needed as we are using a local model
-# GEMINI_API_KEY = 'YOUR_ACTUAL_GEMINI_API_KEY_HERE'
-# genai.configure(api_key=GEMINI_API_KEY) # This line is removed
+# You MUST replace 'YOUR_ACTUAL_GEMINI_API_KEY_HERE' with your actual Gemini API key.
+# It is highly recommended to load this from an environment variable for security.
+GEMINI_API_KEY = 'AIzaSyDSQc5d5zPd2IXP5kyGF5MNfcACV8JAJHc' #
 
-CHUNKS_FILE_PATH = 'medical_text_chunks.pkl'
-FAISS_INDEX_FILE_PATH = 'medical_faiss_index.bin'
-LOCAL_LLM_PATH = 'local_llm_tinyllama' # Path to the downloaded LLM folder
+if GEMINI_API_KEY == 'YOUR_ACTUAL_GEMINI_API_KEY_HERE' or not GEMINI_API_KEY:
+    print("WARNING: GEMINI_API_KEY is not set or is still the placeholder. "
+          "Please replace 'YOUR_ACTUAL_GEMINI_API_KEY_HERE' with your actual API key "
+          "or set it as an environment variable (e.g., GEMINI_API_KEY='your_key').")
+    # For a real deployment, you might want to exit or raise an error here.
+    # For local testing, we'll allow it to proceed with a warning.
+
+genai.configure(api_key=GEMINI_API_KEY) #
+
+CHUNKS_FILE_PATH = os.path.join('medprompt_ai_data', 'medical_text_chunks.pkl') #
+FAISS_INDEX_FILE_PATH = os.path.join('medprompt_ai_data', 'medical_faiss_index.bin') #
 
 text_chunks_db = []
 faiss_index = None
 embedding_model = None
-local_llm_tokenizer = None
-local_llm_model = None
-text_generation_pipeline = None # Hugging Face pipeline for easier generation
+gemini_model = None
 
-# --- Load Pre-processed Data and Local LLM ---
-def load_preprocessed_data_and_llm():
-    global text_chunks_db, faiss_index, embedding_model, local_llm_tokenizer, local_llm_model, text_generation_pipeline
+# --- Load Pre-processed Data and Configure Gemini LLM ---
+def load_preprocessed_data_and_configure_gemini():
+    global text_chunks_db, faiss_index, embedding_model, gemini_model
 
-    print("Loading Sentence-Transformer embedding model for backend...")
+    print("Loading pre-processed data...") #
     try:
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        print("Embedding model loaded.")
-    except Exception as e:
-        print(f"Error loading Sentence-Transformer model: {e}")
-        print("Please ensure 'sentence-transformers' library is installed (`pip install sentence-transformers`).")
-        return False
+        if not os.path.exists(CHUNKS_FILE_PATH): #
+            raise FileNotFoundError(f"Chunks file not found: {CHUNKS_FILE_PATH}. Run model.py first.") #
+        with open(CHUNKS_FILE_PATH, 'rb') as f: #
+            text_chunks_db = pickle.load(f) #
+        print(f"Loaded {len(text_chunks_db)} text chunks.") #
 
-    print(f"Loading text chunks from {CHUNKS_FILE_PATH}...")
+        if not os.path.exists(FAISS_INDEX_FILE_PATH): #
+            raise FileNotFoundError(f"FAISS index file not found: {FAISS_INDEX_FILE_PATH}. Run model.py first.") #
+        faiss_index = faiss.read_index(FAISS_INDEX_FILE_PATH) #
+        print(f"Loaded FAISS index with {faiss_index.ntotal} vectors.") #
+
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2') #
+        print("Loaded Embedding Model: all-MiniLM-L6-v2.") #
+
+    except FileNotFoundError as e: #
+        print(f"Error loading pre-processed data: {e}. Make sure you run model.py first to generate these files.") #
+        exit(1)
+    except Exception as e: #
+        print(f"An unexpected error occurred during data loading: {e}") #
+        exit(1)
+
+    print("\nConfiguring Gemini LLM...") #
     try:
-        with open(CHUNKS_FILE_PATH, 'rb') as f:
-            text_chunks_db = pickle.load(f)
-        print(f"Loaded {len(text_chunks_db)} text chunks.")
-    except FileNotFoundError:
-        print(f"Error: {CHUNKS_FILE_PATH} not found. Please ensure it's in the correct directory.")
-        text_chunks_db = []
-        return False
-    except Exception as e:
-        print(f"Error loading text chunks: {e}")
-        text_chunks_db = []
-        return False
+        gemini_model = genai.GenerativeModel('gemini-2.0-flash') #
+        print("Gemini 'gemini-2.0-flash' model configured successfully.") #
+    except Exception as e: #
+        print(f"Error configuring Gemini LLM: {e}. Please check your GEMINI_API_KEY and network connection.") #
+        exit(1)
 
-    print(f"Loading FAISS index from {FAISS_INDEX_FILE_PATH}...")
-    try:
-        faiss_index = faiss.read_index(FAISS_INDEX_FILE_PATH)
-        print(f"FAISS index loaded with {faiss_index.ntotal} vectors.")
-    except FileNotFoundError:
-        print(f"Error: {FAISS_INDEX_FILE_PATH} not found. Please ensure it's in the correct directory.")
-        faiss_index = None
-        return False
-    except Exception as e:
-        print(f"Error loading FAISS index: {e}")
-        faiss_index = None
-        return False
+# Call the loading function when the app starts
+load_preprocessed_data_and_configure_gemini() #
 
-    print(f"\n--- Loading Local Generative LLM from {LOCAL_LLM_PATH} ---")
-    try:
-        # Check for CUDA device
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device for LLM: {device}")
-
-        local_llm_tokenizer = AutoTokenizer.from_pretrained(LOCAL_LLM_PATH)
-        local_llm_model = AutoModelForCausalLM.from_pretrained(
-            LOCAL_LLM_PATH,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            low_cpu_mem_usage=True # Helps with memory on CPU
-        ).to(device) # Move model to appropriate device
-
-        # Create a text generation pipeline for easier inference
-        text_generation_pipeline = pipeline(
-            "text-generation",
-            model=local_llm_model,
-            tokenizer=local_llm_tokenizer,
-            device=0 if device == "cuda" else -1 # 0 for first GPU, -1 for CPU
-        )
-        print("Local LLM and tokenizer loaded successfully.")
-    except FileNotFoundError:
-        print(f"Error: Local LLM model not found at {LOCAL_LLM_PATH}.")
-        print("Please ensure the 'local_llm_tinyllama' folder is in the correct directory.")
-        local_llm_tokenizer = None
-        local_llm_model = None
-        text_generation_pipeline = None
-        return False
-    except Exception as e:
-        print(f"Error loading local LLM: {e}")
-        local_llm_tokenizer = None
-        local_llm_model = None
-        text_generation_pipeline = None
-        return False
-
-    return True
-
-# Load data and LLM when the Flask app starts
-with app.app_context():
-    if not load_preprocessed_data_and_llm():
-        print("CRITICAL: Failed to load all necessary components. The application may not function correctly.")
-
-# --- RAG (Retrieval-Augmented Generation) Logic ---
-def retrieve_relevant_context(query, top_k=5):
-    if faiss_index is None or embedding_model is None or not text_chunks_db:
-        print("RAG components not fully loaded. Cannot retrieve context.")
-        return []
-
-    try:
-        query_embedding = embedding_model.encode([query])
-        query_embedding = np.array(query_embedding).astype('float32')
-
-        D, I = faiss_index.search(query_embedding, top_k)
-
-        relevant_chunks = []
-        for i in I[0]:
-            if i != -1:
-                relevant_chunks.append(text_chunks_db[i]['text'])
-        return relevant_chunks
-    except Exception as e:
-        print(f"Error during context retrieval: {e}")
-        return []
-
-# --- Flask Route to Serve Frontend HTML ---
+# --- Flask Routes ---
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('index.html') #
 
-# --- Flask API Endpoint for Asking Questions ---
 @app.route('/ask', methods=['POST'])
-def ask_medpromptai():
-    data = request.json
-    question = data.get('question')
-
-    if not question:
-        return jsonify({"error": "No question provided"}), 400
-
-    if text_generation_pipeline is None:
-        return jsonify({"error": "Local LLM is not loaded. Cannot generate response."}), 500
+def ask_medprompt_ai():
+    user_question = request.json.get('question') #
+    if not user_question: #
+        return jsonify({"error": "No question provided"}), 400 #
 
     try:
-        relevant_contexts = retrieve_relevant_context(question, top_k=5)
+        if not embedding_model or not faiss_index or not gemini_model: #
+            return jsonify({"error": "MedPromptAI is still initializing or encountered a critical loading error. Please wait a moment and try again. If the issue persists, check server logs."}), 503 #
 
-        context_string = ""
-        if relevant_contexts:
-            context_string = "\nRelevant Medical Information (from Textbooks):\n" + "\n\n".join(relevant_contexts) + "\n\n"
-        else:
-            context_string = "No highly relevant context found in the provided medical textbooks. Relying on general knowledge from the AI model.\n\n"
+        question_embedding = embedding_model.encode([user_question]).astype('float32') #
 
-        # --- PROMPT FOR LOCAL LLM ---
-        # The prompt is designed to guide the small LLM to act as a chatbot
-        # and use the provided context.
-        prompt = f"""
-        You are a helpful, knowledgeable, and safe AI medical chatbot. Your primary goal is to provide accurate general health information based *only* on the provided contextual information from trusted medical textbooks.
-        Respond in complete, grammatically correct sentences. Maintain a friendly and conversational tone.
-        Do not use outside knowledge unless explicitly stated that the provided context is insufficient.
-        Crucially, never provide a direct medical diagnosis, prescribe treatment, or give personalized medical advice.
-        Always state if the provided context is insufficient to fully answer the question.
-        At the end of your response, always remind the user to consult a qualified healthcare professional for personalized medical advice.
+        D, I = faiss_index.search(question_embedding, k=5) # k=5 for top 5 most relevant chunks
+        relevant_indices = I[0] #
 
-        {context_string}
+        relevant_contexts = [text_chunks_db[idx]['text'] for idx in relevant_indices if idx < len(text_chunks_db)] #
+        context_str = "\n".join(relevant_contexts) #
 
-        Based *only* on the 'Relevant Medical Information' provided above (if any), please answer the following medical question in a conversational manner:
-        Question: {question}
-        """
-
-        # Generate response using the local LLM pipeline
-        # max_new_tokens: controls the length of the generated response
-        # num_return_sequences: how many different responses to generate (we take the first)
-        # temperature: creativity (lower for more factual, higher for more creative)
-        # do_sample: set to True to enable sampling (using temperature)
-        # top_k, top_p: sampling strategies
-        outputs = text_generation_pipeline(
+        prompt = (
+            "You are a medical assistant chatbot. "
+            "Based on the following medical context, answer the user's question concisely and accurately. "
+            "If the information is not directly available in the provided context, state that you cannot answer based on the given information. "
+            "Do not make up information. Do not mention the context directly in your answer, just use the information.\n\n"
+            "Medical Context:\n" + context_str + "\n\n"
+            "User Question: " + user_question + "\n\n"
+            "Answer:"
+        ) #
+        
+        response = gemini_model.generate_content( #
             prompt,
-            max_new_tokens=500, # Adjust as needed for desired response length
-            num_return_sequences=1,
-            temperature=0.7,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            pad_token_id=local_llm_tokenizer.eos_token_id # Important for handling padding
+            generation_config=genai.types.GenerationConfig( #
+                temperature=0.7, #
+                max_output_tokens=512, #
+            ),
+            safety_settings=[ #
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}, #
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}, #
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"}, #
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}, #
+            ]
         )
-        ai_response_text = outputs[0]['generated_text']
+        
+        ai_response_text = "" #
+        try:
+            ai_response_text = response.text.strip() #
+        except ValueError as e: #
+            if 'safety_ratings' in response.candidates[0]: #
+                safety_feedback = "The response was blocked due to safety concerns." #
+                for rating in response.candidates[0].safety_ratings: #
+                    safety_feedback += f"\n- {rating.category}: {rating.probability}" #
+                ai_response_text = f"I apologize, I cannot generate a response for that query. {safety_feedback}" #
+            else:
+                ai_response_text = "I apologize, I could not generate a response for your query." #
+            print(f"Gemini API generation error or block: {e}") #
 
-        # The model might repeat the prompt, so we need to clean it
-        if ai_response_text.startswith(prompt):
-            ai_response_text = ai_response_text[len(prompt):].strip()
-
-        # Basic Hallucination/Safety Filtering (Post-processing)
         safety_keywords = [
             "your diagnosis is", "you have", "I diagnose", "prescribe", "take this medication",
-            "treatment for you is", "your condition is", "I recommend you take", "cure for",
+            "treatment for you is", "I recommend you take", "cure for",
             "you should take", "my diagnosis is"
-        ]
-        flagged_for_review = False
-        for keyword in safety_keywords:
-            if keyword in ai_response_text.lower():
-                flagged_for_review = True
-                break
+        ] #
+        flagged_for_review = False #
+        for keyword in safety_keywords: #
+            if keyword in ai_response_text.lower(): #
+                flagged_for_review = True #
+                break #
 
-        disclaimer_text = "\n\n--- DISCLAIMER ---\nThis AI tool provides general health information and is not a substitute for professional medical advice, diagnosis, or treatment. Always consult a qualified healthcare provider for personalized medical advice."
-        if disclaimer_text.lower().strip() not in ai_response_text.lower().strip():
-            ai_response_text += disclaimer_text
+        # REMOVED: Disclaimer text appending logic
+        # disclaimer_text = "\n\n--- DISCLAIMER ---\nThis AI tool provides general health information and is not a substitute for professional medical advice, diagnosis, or treatment. Always consult a qualified healthcare provider for personalized medical advice."
+        # if disclaimer_text.lower().strip().replace(' ', '') not in ai_response_text.lower().strip().replace(' ', ''):
+        #     ai_response_text += disclaimer_text
 
         return jsonify({
             "answer": ai_response_text,
-            "retrieved_context": relevant_contexts,
             "flagged_for_review": flagged_for_review
         })
 
     except Exception as e:
-        print(f"Error in /ask endpoint: {e}")
-        return jsonify({"error": "An error occurred while processing your request. Please try again or re-check the backend server."}), 500
+        print(f"Error in /ask endpoint: {e}") #
+        return jsonify({"error": "An error occurred while processing your request. Please try again or re-check the backend server."}), 500 #
 
 # --- Running the Flask App ---
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True) #
